@@ -64,8 +64,8 @@ class PrinterMarlin(Printer):
 	def rampdown(self):
 		if self._comm:	
 			self._comm.close()
-			self._comm.thread.join()		
-			del self._comm
+			self._comm.thread.join()
+			self._comm = None
 
 		super(PrinterMarlin, self).rampdown()
 
@@ -335,22 +335,6 @@ class PrinterMarlin(Printer):
 		"""
 		self._addMessage(message)
 
-	def mcZChange(self, newZ):
-		"""
-		 Callback method for the comm object, called upon change of the z-layer.
-		"""
-		oldZ = self._currentZ
-		if newZ != oldZ:
-			# we have to react to all z-changes, even those that might "go backward" due to a slicer's retraction or
-			# anti-backlash-routines. Event subscribes should individually take care to filter out "wrong" z-changes
-			eventManager().fire(Events.Z_CHANGE, {"new": newZ, "old": oldZ})
-
-		self._setCurrentZ(newZ)
-
-	def mcLayerChange(self, layer):
-		eventManager().fire(Events.LAYER_CHANGE, {"layer": layer})
-		self._currentLayer = layer;
-
 	def mcSdStateChange(self, sdReady):
 		self._stateMonitor.setState({"text": self.getStateString(), "flags": self._getStateFlags()})
 
@@ -366,12 +350,7 @@ class PrinterMarlin(Printer):
 			self.startPrint()
 
 	def mcPrintjobDone(self):
-		#stop timelapse if there was one
-		self._cameraManager.stop_timelapse()
-		
-		#Not sure if this is the best way to get the layer count
-		self._setProgressData(1.0, self._selectedFile["filesize"], self._comm.getPrintTime(), 0, self._layerCount)
-		self._stateMonitor.setState({"state": self._state, "stateString": self.getStateString(), "flags": self._getStateFlags()})
+		super(PrinterMarlin, self).mcPrintjobDone()
 
 		#don't send home command, some printers don't have stoppers.
 		#self.home(['x','y'])

@@ -13,7 +13,6 @@ from octoprint.util import getExceptionString
 
 from makerbot_driver import GcodeAssembler
 from makerbot_driver.errors import BuildCancelledError, ProtocolError, ExternalStopError, PacketTooBigError, BufferOverflowError
-from makerbot_driver.Gcode import GcodeParser
 from makerbot_driver.Gcode.errors import UnrecognizedCommandError
 
 class PrintJobS3G(threading.Thread):
@@ -23,13 +22,18 @@ class PrintJobS3G(threading.Thread):
 		super(PrintJobS3G, self).__init__()
 
 		self._logger = logging.getLogger(__name__)
+		self._serialLogger = logging.getLogger('SERIAL')
 		self._printer = printer
 		self._file = currentFile
 		self._canceled = False
 		self._heatingPlatform = False
 		self._heatingTool = False
 		self._heatupWaitStartTime = 0
+		self._currentZ = None
+		self._lastLayerHeight = None
+		self._currentLayer = None
 		self.daemon = True
+
 
 		# ~~~ From https://github.com/jetty840/ReplicatorG/blob/master/scripts/s3g-decompiler.py
 
@@ -57,10 +61,12 @@ class PrintJobS3G(threading.Thread):
 			136: self.parseToolAction,
 			137: "<B",
 			138: "<H",
-			139: "<iiiiiI",
+			#139: "<iiiiiI",
+			139: self.parseQueueExtendedPoint,
 			140: "<iiiii",
 			141: self.parseWaitForPlatformAction,
-			142: "<iiiiiIB",
+			#142: "<iiiiiIB",
+			142: self.parseQueueExtendedPointNew,
 			143: "<b",
 			144: "<b",
 			145: "<BB",
@@ -73,7 +79,8 @@ class PrintJobS3G(threading.Thread):
 			152: "<B",
 			153: self.parseBuildStartNotificationAction,
 			154: "<B",
-			155: "<iiiiiIBfh",
+			#155: "<iiiiiIBfh",
+			155: self.parseQueueExtendedPointX3g,
 			156: "<B",
 			157: "<BBBIHHIIB",
 			158: "<f"
@@ -89,45 +96,20 @@ class PrintJobS3G(threading.Thread):
 		self._printer.mcHeatingUpUpdate(True)
 		self._heatupWaitStartTime = time.time()
 		self._heatingTool = True
+		self._lastLayerHeight = 0.0
+		self._currentLayer = 0
 
 		try:
-			assembler = GcodeAssembler(profile)
-			start, end, variables = assembler.assemble_recipe()
-			start_gcode = assembler.assemble_start_sequence(start)
-			end_gcode = assembler.assemble_end_sequence(end)
-
-			variables.update({
-				'START_X': profile.values['print_start_sequence']['start_position']['start_x'],
-				'START_Y': profile.values['print_start_sequence']['start_position']['start_y'],
-				'START_Z': profile.values['print_start_sequence']['start_position']['start_z']
-			})
-
-			self._parser = GcodeParser()
-			self._parser.environment.update(variables)
-			self._parser.state.set_build_name(os.path.basename(self._file['filename'])[:15])
-			self._parser.state.profile = profile
-			self._parser.s3g = self._printer._comm
-
 			self._printer._comm.reset()
-
-			#self._parser.state.values['last_extra_index'] = 0
-			#self._parser.state.values['last_platform_index'] = 0
-
-			if self._printer._firmwareVersion >= 700:
-				vid, pid = self._printer._comm.get_vid_pid_iface()
-				self._parser.s3g.x3g_version(1, 0, pid=pid) # Currently hardcode x3g v1.0
-
-			for line in start_gcode:
-				self.exec_gcode_line(line)
-
-			self.exec_gcode_line('G1 X0 Y0 Z0')
+			self._printer._comm.build_start_notification(os.path.basename(self._file['filename'])[:15])
+			self._printer._comm.set_build_percent(0)
 
 			self._file['start_time'] = time.time()
 			self._file['progress'] = 0
 
 			lastProgressReport = 0
 			lastProgressValueSentToPrinter = 0
-			lastHeatingCheck = 0
+			lastHeatingCheck = self._file['start_time']
 
 			with open(self._file['filename'], 'rb') as f:
 				while True:
@@ -141,13 +123,18 @@ class PrintJobS3G(threading.Thread):
 
 						packet.append(ord(command))
 
-						(command) = struct.unpack("B",command)
-						parse = self.commandTable[command[0]]
+						command = struct.unpack("B",command)
+						try:
+							parse = self.commandTable[command[0]]
+
+						except KeyError:
+							raise Exception("Unexpected packet type: 0x%x" % command[0])
+
 						if type(parse) == type(""):
 							packetLen = struct.calcsize(parse)
 							packetData = f.read(packetLen)
 							if len(packetData) != packetLen:
-								raise "Packet incomplete"
+								raise Exception("Packet incomplete")
 						else:
 							packetData = parse(f)
 
@@ -155,6 +142,9 @@ class PrintJobS3G(threading.Thread):
 							packet.append(ord(c))
 
 						if self.send_packet(packet):
+							if self._serialLogger.isEnabledFor(logging.DEBUG):
+								self._serialLogger.debug('{"event":"packet_sent", "data": "%s"}' % ' '.join('0x{:02x}'.format(x) for x in packet) )
+
 							now = time.time()
 							if now - lastProgressReport > self.UPDATE_INTERVAL_SECS:
 								position = f.tell()
@@ -190,12 +180,14 @@ class PrintJobS3G(threading.Thread):
 					except ProtocolError as e:
 						self._logger.warn('ProtocolError: %s' % e)
 
-			if self._canceled:
-				self._printer._comm.build_end_notification()
+			self._printer._comm.build_end_notification()
 
-			else:
-				for line in end_gcode:
-					self.exec_gcode_line(line)
+			if self._canceled:
+				self._printer._comm.clear_buffer()
+
+			self._printer._comm.find_axes_maximums(['x', 'y'], 200, 10)
+			self._printer._comm.find_axes_maximums(['z'], 100, 10)
+			self._printer._comm.toggle_axes(['x','y','z','a','b'], False)
 
 			self._printer._changeState(self._printer.STATE_OPERATIONAL)
 
@@ -203,28 +195,47 @@ class PrintJobS3G(threading.Thread):
 				"file": self._file['filename'],
 				"filename": os.path.basename(self._file['filename']),
 				"origin": self._file['origin'],
-				"time": self._printer.getPrintTime()
+				"time": self._printer.getPrintTime(),
+				"layerCount": self._currentLayer
 			}
 
 			if self._canceled:
 				self._printer.printJobCancelled()
 				eventManager().fire(Events.PRINT_FAILED, payload)
+				self._printer._fileManager.printFailed(payload['filename'], payload['time'])
+
 			else:
 				self._printer.mcPrintjobDone()
+				self._printer._fileManager.printSucceeded(payload['filename'], payload['time'], payload['layerCount'])
 				eventManager().fire(Events.PRINT_DONE, payload)
 
 		except BuildCancelledError:
 			self._logger.warn('Build Cancel detected')
-			self.cancel()
 			self._printer.printJobCancelled()
+			payload = {
+				"file": self._file['filename'],
+				"filename": os.path.basename(self._file['filename']),
+				"origin": self._file['origin'],
+				"time": self._printer.getPrintTime()
+			}
 			eventManager().fire(Events.PRINT_FAILED, payload)
+			self._printer._fileManager.printFailed(payload['filename'], payload['time'])
+			self._printer._changeState(self._printer.STATE_OPERATIONAL)
+
 
 		except ExternalStopError:
 			self._logger.warn('External Stop detected')
-			self.cancel()
 			self._printer._comm.writer.set_external_stop(False)
 			self._printer.printJobCancelled()
+			payload = {
+				"file": self._file['filename'],
+				"filename": os.path.basename(self._file['filename']),
+				"origin": self._file['origin'],
+				"time": self._printer.getPrintTime()
+			}
 			eventManager().fire(Events.PRINT_FAILED, payload)
+			self._printer._fileManager.printFailed(payload['filename'], payload['time'])
+			self._printer._changeState(self._printer.STATE_OPERATIONAL)
 
 		except Exception:
 			self._errorValue = getExceptionString()
@@ -249,40 +260,23 @@ class PrintJobS3G(threading.Thread):
 				self._logger.warn('The following GCode command was ignored: %s' % line)
 				return False
 
-	def exec_gcode_line(self, line):
-		while True:
-			try:
-				self._parser.execute_line(line)
-				return True
-
-			except BufferOverflowError:
-				time.sleep(.2)
-
-			except PacketTooBigError:
-				self._logger.warn('Printer responded with PacketTooBigError to (%s)' % line)
-				return False
-
-			except UnrecognizedCommandError:
-				self._logger.warn('The following GCode command was ignored: %s' % line)
-				return False
-
 	# ~~~ Slightly modified code for parsing from https://github.com/jetty840/ReplicatorG/blob/master/scripts/s3g-decompiler.py
 
 	def parseToolAction(self, s3gFile):
 		packetStr = s3gFile.read(3)
 		if len(packetStr) != 3:
-			raise "Incomplete s3g file during tool command parse"
+			raise Exception("Incomplete s3g file during tool command parse")
 		(index,command,payload) = struct.unpack("<BBB",packetStr)
 		contents = s3gFile.read(payload)
 		if len(contents) != payload:
-			raise "Incomplete s3g file: tool packet truncated"
+			raise Exception("Incomplete s3g file: tool packet truncated")
 		return packetStr + contents
 
 	def parseWaitForToolAction(self, s3gFile):
 		packetLen = struct.calcsize("<BHH")
 		packetData = s3gFile.read(packetLen)
 		if len(packetData) != packetLen:
-			raise "Packet incomplete"
+			raise Exception("Packet incomplete")
 
 		if not self._printer._heatingUp:
 			self._printer._heatingUp = True
@@ -296,7 +290,7 @@ class PrintJobS3G(threading.Thread):
 		packetLen = struct.calcsize("<BHH")
 		packetData = s3gFile.read(packetLen)
 		if len(packetData) != packetLen:
-			raise "Packet incomplete"
+			raise Exception("Packet incomplete")
 
 		if not self._printer._heatingUp:
 			self._printer._heatingUp = True
@@ -309,7 +303,7 @@ class PrintJobS3G(threading.Thread):
 	def parseDisplayMessageAction(self, s3gFile):
 		packetStr = s3gFile.read(4)
 		if len(packetStr) < 4:
-			raise "Incomplete s3g file during tool command parse"
+			raise Exception("Incomplete s3g file during tool command parse")
 		message = "";
 		while True:
 		   	c = s3gFile.read(1);
@@ -322,7 +316,7 @@ class PrintJobS3G(threading.Thread):
 	def parseBuildStartNotificationAction(self, s3gFile):
 		packetStr = s3gFile.read(4)
 		if len(packetStr) < 4:
-			raise "Incomplete s3g file during tool command parse"
+			raise Exception("Incomplete s3g file during tool command parse")
 		buildName = "";
 		while True:
 			c = s3gFile.read(1);
@@ -331,3 +325,37 @@ class PrintJobS3G(threading.Thread):
 				break;
 
 		return packetStr + buildName
+
+	def parseMovement(self, s3gFile, format):
+		packetLen = struct.calcsize(format)
+		packetData = s3gFile.read(packetLen)
+		if len(packetData) != packetLen:
+			raise Exception("Packet incomplete")
+
+		unpacked = struct.unpack(format, buffer(packetData))
+
+		if unpacked[2] != self._currentZ:
+			self._currentZ = unpacked[2]
+			self._printer.mcZChange(float(unpacked[2])/float(self._printer._profile.values['axes']['Z']['steps_per_mm']))
+		elif self._currentZ != self._lastLayerHeight \
+			and (unpacked[3] != 0 or unpacked[4] != 0): #add check for extrusion to avoid counting missed layers
+			
+			if self._currentZ > self._lastLayerHeight:
+				self._currentLayer += 1
+				self._printer.mcLayerChange(self._currentLayer)
+
+			self._lastLayerHeight = self._currentZ
+
+		return packetData, unpacked
+
+	def parseQueueExtendedPoint(self, s3gFile):
+		raw, unpacked = self.parseMovement(s3gFile, "<iiiiiI")
+		return raw
+
+	def parseQueueExtendedPointNew(self, s3gFile):
+		raw, unpacked = self.parseMovement(s3gFile, "<iiiiiIB")
+		return raw
+
+	def parseQueueExtendedPointX3g(self, s3gFile):
+		raw, unpacked = self.parseMovement(s3gFile, "<iiiiiIBfh")
+		return raw

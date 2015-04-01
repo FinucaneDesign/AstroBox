@@ -105,9 +105,7 @@ class Printer(object):
 		self._callbacks = []
 		self._stateMonitor.stop()
 		self._stateMonitor._worker.join()
-		del self._stateMonitor
 		self._fileManager.rampdown()
-		del self._fileManager
 
 	def getConnectionOptions(self):
 		"""
@@ -316,6 +314,21 @@ class Printer(object):
 			self._cameraManager.pause_timelapse()
 
 	#~~~ Printer callbacks ~~~
+	def mcZChange(self, newZ):
+		"""
+		 Callback method for the comm object, called upon change of the z-layer.
+		"""
+		oldZ = self._currentZ
+		if newZ != oldZ:
+			# we have to react to all z-changes, even those that might "go backward" due to a slicer's retraction or
+			# anti-backlash-routines. Event subscribes should individually take care to filter out "wrong" z-changes
+			eventManager().fire(Events.Z_CHANGE, {"new": newZ, "old": oldZ})
+
+		self._setCurrentZ(newZ)
+
+	def mcLayerChange(self, layer):
+		eventManager().fire(Events.LAYER_CHANGE, {"layer": layer})
+		self._currentLayer = layer;
 
 	def mcTempUpdate(self, temp, bedTemp):
 		self._addTemperatureData(temp, bedTemp)
@@ -344,7 +357,12 @@ class Printer(object):
 		self._setProgressData(progress, self.getPrintFilepos(), printTime, estimatedTimeLeft, self._currentLayer)
 
 	def mcPrintjobDone(self):
-		pass
+		#stop timelapse if there was one
+		self._cameraManager.stop_timelapse()
+		
+		#Not sure if this is the best way to get the layer count
+		self._setProgressData(1.0, self._selectedFile["filesize"], self.getPrintTime(), 0, self._layerCount)
+		self._stateMonitor.setState({"state": self._state, "stateString": self.getStateString(), "flags": self._getStateFlags()})
 
 	def mcHeatingUpUpdate(self, value):
 		self._stateMonitor._state['flags']['heatingUp'] = value
@@ -550,6 +568,8 @@ class StateMonitor(object):
 			self._changeEvent.wait()
 
 			if self._stop:
+				#one last update
+				self._updateCallback(self.getCurrentData())
 				break;
 
 			now = time.time()
